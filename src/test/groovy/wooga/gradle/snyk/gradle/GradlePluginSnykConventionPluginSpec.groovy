@@ -70,6 +70,7 @@ class GradlePluginSnykConventionPluginSpec extends ProjectSpec {
         snykExtension.strategies.get() == [SnykPlugin.MONITOR_CHECK]
         snykExtension.failOn.get() == FailOnOption.all
         snykExtension.severityThreshold.get() == SeverityThresholdOption.high
+        snykExtension.orgName.get() == "wooga-pipeline"
 
         where:
         applyAfter | message
