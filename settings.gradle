@@ -27,4 +27,4 @@ pluginManagement {
   }
 }
 
-rootProject.name = 'atlas-snyk-gradle-plugin'
+rootProject.name = 'snyk-gradle-plugin'
