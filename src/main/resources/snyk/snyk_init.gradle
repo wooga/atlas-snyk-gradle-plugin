@@ -1,24 +1,7 @@
-/*
- * Copyright 2022 Wooga GmbH
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-
 import groovy.json.JsonOutput
-import org.gradle.util.GradleVersion
-
 import java.util.regex.Pattern
+import java.util.regex.Matcher
+import org.gradle.util.GradleVersion
 
 // Snyk dependency resolution script for Gradle.
 // Tested on Gradle versions from v2.14 to v6.8.1
@@ -61,20 +44,20 @@ import java.util.regex.Pattern
 
 // interface GradleProjectInfo {
 //   depGraph: DepGraph;
-//   snykGraph: { [name: string]: SnykGraph };
+//   snykGraph: SnykGraph;
 //   targetFile: string;
 // }
-// export interface SnykGraph {
-//   name: string;
-//   version: string;
-//   parentIds: string[];
+// interface SnykGraph {
+//   [id: string]: {
+//     name: string;
+//     version: string;
+//     parentIds: string[];
+//   };
 // }
 
 class SnykGraph {
-
     def nodes
     def rootId
-
     SnykGraph(rootId) {
         this.nodes = [:]
         this.rootId = rootId
@@ -112,7 +95,25 @@ class SnykGraph {
         }
         childNode.parentIds.add(parentId)
     }
+}
 
+class Sha1Map {
+    def coordinates
+    Sha1Map() {
+        coordinates = [:]
+    }
+
+    def setCoordinate(key, value) {
+        this.coordinates[key] = value
+    }
+}
+
+def hash(File file) {
+    def md = java.security.MessageDigest.getInstance('SHA-1')
+    file.eachByte(1024 * 4) { buffer, len ->
+        md.update(buffer, 0, len)
+    }
+    return md.digest().encodeHex().toString()
 }
 
 def loadGraph(Iterable deps, SnykGraph graph, parentId, currentChain) {
@@ -134,6 +135,36 @@ def loadGraph(Iterable deps, SnykGraph graph, parentId, currentChain) {
     }
 }
 
+def loadSha1MapGraph(Iterable deps, SnykGraph graph, parentId, currentChain, sha1Map) {
+    deps.each { dep ->
+        dep.each { d ->
+            def childId = "${d.moduleGroup}:${d.moduleName}@${d.moduleVersion}"
+            if (!graph.nodes.get(childId)) {
+                def childDependency = ['name': "${d.moduleGroup}:${d.moduleName}", 'version': d.moduleVersion]
+                graph.setNode(childId, childDependency)
+
+                def moduleArtifacts = d.getModuleArtifacts()
+                if (moduleArtifacts[0] && moduleArtifacts[0].getExtension()) {
+                    // TODO: filter out this project's modules from deps.
+                    try {
+                        def fileHash = hash(moduleArtifacts[0].getFile())
+                        sha1Map.setCoordinate(fileHash, childId);
+                    } catch (Exception e) {
+                        debugLog("Failed to hash artifact ${moduleArtifacts[0]}")
+                    }
+                }
+            }
+            //  In Gradle 2, there can be several instances of the same dependency present at each level,
+            //  each for a different configuration. In this case, we need to merge the dependencies.
+            if (!currentChain.contains(childId) && d.children) {
+                currentChain.add(childId)
+                loadSha1MapGraph(d.children, graph, childId, currentChain, sha1Map)
+            }
+            graph.setEdge(parentId, childId)
+        }
+    }
+}
+
 def getSnykGraph(Iterable deps) {
     def rootId = 'root-node'
     def graph = new SnykGraph(rootId)
@@ -143,8 +174,21 @@ def getSnykGraph(Iterable deps) {
     return graph.nodes
 }
 
-def snykEcho(msg) {
-    println("SNYKECHO $msg")
+def getSnykGraphWithSha1Map(Iterable deps, Sha1Map sha1Map) {
+    if (!sha1Map) sha1Map = new Sha1Map()
+    def rootId = 'root-node'
+    def graph = new SnykGraph(rootId)
+    def currentChain = new HashSet()
+    loadSha1MapGraph(deps, graph, rootId, currentChain, sha1Map)
+
+    return [graph: graph.nodes, sha1Map: sha1Map]
+}
+
+def debugLog(msg) {
+    def debug = System.getenv('DEBUG') ?: ''
+    if (debug.length() > 0) {
+        println("SNYKECHO $msg")
+    }
 }
 
 def matchesAttributeFilter(conf, confAttrSpec) {
@@ -178,32 +222,47 @@ def findMatchingConfigs(confs, confNameFilter, confAttrSpec) {
 def findProjectConfigs(proj, confNameFilter, confAttrSpec) {
     def matching = findMatchingConfigs(proj.configurations, confNameFilter, confAttrSpec)
     //Also pull the `buildScript` classpath configuration here since this contains the build time dependencies (plugins etc)
-    snykEcho("add buildScript classpath configuration")
+    debugLog("add buildScript classpath configuration")
     def classpath = proj.getBuildscript().getConfigurations().findAll { it.name == "classpath" }
     matching.addAll(classpath)
     if (GradleVersion.current() < GradleVersion.version('3.0')) {
-        proj.configurations.each({ snykEcho("conf.name=$it.name") })
+        proj.configurations.each({ debugLog("conf.name=$it.name") })
         return matching
     }
-    proj.configurations.each({ snykEcho("conf.name=$it.name; conf.canBeResolved=$it.canBeResolved; conf.canBeConsumed=$it.canBeConsumed") })
-    // We are looking for a configuration that `canBeResolved`, because it's a configuration for which 
+    proj.configurations.each({ debugLog("conf.name=$it.name; conf.canBeResolved=$it.canBeResolved; conf.canBeConsumed=$it.canBeConsumed") })
+    // We are looking for a configuration that `canBeResolved`, because it's a configuration for which
     // we can compute a dependency graph and that contains all the necessary information for resolution to happen.
-    // if we cannot find dependencies that can be only resolved but not consumable
-    // we try to find configs that are simultaneously resolvable and consumable
-    // to prevent dependency resolution conflicts (e.g. Cannot choose between the following variants) 
-    // we avoid the coexistence of (canBeResolved: true, canBeConsumed: false) and (canBeResolved: true, canBeConsumed: true) configs
-    def resolvable = matching.findAll({ it.canBeResolved == true })
-    snykEcho("resolvableConfigs=$resolvable")
+    // See Gradle docs: https://docs.gradle.org/current/userguide/declaring_dependencies.html#sec:resolvable-consumable-configs
+    def resolvable = []
+    matching.each({ it ->
+        if (!it.canBeResolved) { return }
+        try {
+            // Try accessing resolvedConfiguration to filter out configs that may cause issues in strict lock mode
+            it.resolvedConfiguration
+            resolvable.add(it)
+        } catch (Exception ex) {
+            // Swallow the error
+            debugLog("Skipping config ${it.name} due to resolvedConfiguration error.")
+        }
+    })
+    debugLog("resolvableConfigs=$resolvable")
     return resolvable
+}
+
+String formatPath(path) {
+    return path.replace(':', '/').replaceAll(~/(^\/+?)|(\/+$)/, '')
+}
+
+Boolean isRootPath(path){
+    return path == rootProject.path
 }
 
 // We are attaching this task to every project, as this is the only reliable way to run it
 // when we start with a subproject build.gradle. As a consequence, we need to make sure we
 // only ever run it once, for the "starting" project.
 def snykDepsConfExecuted = false
-allprojects { currProj ->
-    snykEcho("Current project: $currProj.name")
-    //wait for project to evaluate and the official snyk dependency script to be executed
+allprojects { Project currProj ->
+    debugLog("Current project: $currProj.name")
     afterEvaluate {
         //the real script should have added a task with name 'snykResolvedDepsJson'
         //we simply delete all actions and provide our own.
@@ -225,8 +284,8 @@ allprojects { currProj ->
                 if (snykDepsConfExecuted) {
                     return
                 }
-                snykEcho('snykResolvedDepsJson task is executing via doLast')
-                // snykEcho("onlyProj=$onlyProj; confNameFilter=$confNameFilter; confAttrSpec=$confAttrSpec")
+                debugLog('snykResolvedDepsJson task is executing via doLast')
+                // debugLog("onlyProj=$onlyProj; confNameFilter=$confNameFilter; confAttrSpec=$confAttrSpec")
                 // First pass: scan all configurations that match the attribute filter and collect all attributes
                 // from them, to use unambiguous values of the attributes on the merged configuration.
                 //
@@ -254,22 +313,17 @@ allprojects { currProj ->
                                 })
                             }
                 }
-
-                def defaultProjectName = task.project.name
-                def allSubProjectNames = []
-                def seenSubprojects = [:]
+                // name of target project - either specified by --file or the root of a multi-module build
+                String defaultProjectName = task.project.name
+                // the path of the above, preferred over name because path is unique
+                String defaultProjectKey = isRootPath(task.project.path) ? defaultProjectName : formatPath(task.project.path)
+                // collect all subprojects names that are not target
+                List allSubProjectNames = []
                 allprojects
-                        .findAll({ it.name != defaultProjectName })
+                        .findAll({ it.path != task.project.path })
                         .each({
-                            def projKey = it.name
-                            if (seenSubprojects.get(projKey)) {
-                                projKey = it.path.replace(':', '/').replaceAll(~/(^\/+?)|(\/+$)/, '')
-                                if (projKey == "") {
-                                    projKey = defaultProjectName
-                                }
-                            }
+                            String projKey = formatPath(it.path)
                             allSubProjectNames.add(projKey)
-                            seenSubprojects[projKey] = true
                         })
                 def shouldScanProject = {
                     onlyProj == null ||
@@ -278,7 +332,7 @@ allprojects { currProj ->
                 }
                 def projectsDict = [:]
 
-                snykEcho("defaultProjectName=$defaultProjectName; allSubProjectNames=$allSubProjectNames")
+                debugLog("defaultProjectName=$defaultProjectName; defaultProjectKey=$defaultProjectKey; allSubProjectNames=$allSubProjectNames")
 
                 // These will be used to suggest attribute filtering to the user if the scan fails
                 // due to ambiguous resolution of dependency variants
@@ -286,38 +340,35 @@ allprojects { currProj ->
                 println("JSONATTRS $jsonAttrs")
 
                 rootProject.allprojects.findAll(shouldScanProject).each { proj ->
-                    snykEcho("processing project: name=$proj.name; path=$proj.path")
+                    debugLog("processing project: name=$proj.name; path=$proj.path")
 
                     def resolvableConfigs = findProjectConfigs(proj, confNameFilter, confAttrSpec)
                     def resolvedConfigs = []
                     resolvableConfigs.each({ config ->
                         def resConf = config.resolvedConfiguration
-                        snykEcho("config `$config.name' resolution has errors: ${resConf.hasError()}")
+                        debugLog("config `$config.name' resolution has errors: ${resConf.hasError()}")
                         if (!resConf.hasError()) {
                             resolvedConfigs.add(resConf)
-                            snykEcho("first level module dependencies for config `$config.name': $resConf.firstLevelModuleDependencies")
+                            debugLog("first level module dependencies for config `$config.name': $resConf.firstLevelModuleDependencies")
                         }
                     })
-                    if (resolvedConfigs.isEmpty() && !proj.configurations.isEmpty()) {
-                        throw new RuntimeException('Matching configurations not found: ' + confNameFilter +
-                                ', available configurations for project ' + proj + ': '
-                                + proj.configurations.collect { it.name })
+                    if (resolvedConfigs.isEmpty() && !resolvableConfigs.isEmpty()) {
+                        throw new RuntimeException('Configurations: ' + resolvableConfigs.collect { it.name } +
+                                ' for project ' + proj + ' could not be resolved.')
                     }
 
                     def nonemptyFirstLevelDeps = resolvedConfigs.resolvedConfiguration.firstLevelModuleDependencies.findAll({ !it.isEmpty() })
-                    snykEcho("non-empty first level deps for project `$proj.name': $nonemptyFirstLevelDeps")
+                    debugLog("non-empty first level deps for project `$proj.name': $nonemptyFirstLevelDeps")
 
-                    snykEcho('converting gradle graph to snyk-graph format')
+                    debugLog('converting gradle graph to snyk-graph format')
                     def projGraph = getSnykGraph(nonemptyFirstLevelDeps)
-                    def projKey = proj.name
-                    if (projectsDict.get(projKey)) {
-                        snykEcho("The deps dict already has a project with key `$projKey'; using the full path")
-                        projKey = proj.path.replace(':', '/').replaceAll(~/(^\/+?)|(\/+$)/, '')
-                        if (projKey == "") {
-                            snykEcho("project path is empty (proj.path=$proj.path)! will use defaultProjectName=$defaultProjectName")
-                            projKey = defaultProjectName
-                        }
+                    String projKey = formatPath(proj.path)
+                    // if project is root ":", it's formatted to "" - we can't have an empty string as a key so use default name
+                    if (projKey == "") {
+                        debugLog("project path is empty (proj.path=$proj.path)! will use defaultProjectName=$defaultProjectName")
+                        projKey = defaultProjectKey
                     }
+
                     projectsDict[projKey] = [
                             'targetFile'    : findProject(proj.path).buildFile.toString(),
                             'snykGraph'     : projGraph,
@@ -327,6 +378,7 @@ allprojects { currProj ->
 
                 def result = [
                         'defaultProject'    : defaultProjectName,
+                        'defaultProjectKey' : defaultProjectKey,
                         'projects'          : projectsDict,
                         'allSubProjectNames': allSubProjectNames
                 ]
