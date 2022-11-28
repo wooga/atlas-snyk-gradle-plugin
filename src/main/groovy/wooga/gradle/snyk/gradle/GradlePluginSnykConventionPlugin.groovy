@@ -16,6 +16,7 @@
 
 package wooga.gradle.snyk.gradle
 
+import com.wooga.snyk.GradleInit
 import org.apache.commons.io.FileUtils
 import org.gradle.api.Plugin
 import org.gradle.api.Project
@@ -73,19 +74,7 @@ class GradlePluginSnykConventionPlugin implements Plugin<Project> {
      * @return a {@code File} object pointing to the custom init script file.
      */
     static File getSnykInitScript() {
-        File tempInitScript = File.createTempFile("snyk_gradle_init", ".gradle")
-        String name = "/snyk/snyk_init.gradle"
-        try {
-            InputStream is = GradlePluginSnykConventionPlugin.class.getResourceAsStream(name)
-            Files.copy(is, tempInitScript.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            FileUtils.forceDelete(tempInitScript);
-            throw e;
-        } catch (NullPointerException e) {
-            FileUtils.forceDelete(tempInitScript);
-            throw new FileNotFoundException("File " + name + " was not found inside JAR.");
-        }
-        tempInitScript
+        GradleInit.getSnykInitScript()
     }
 
 }
