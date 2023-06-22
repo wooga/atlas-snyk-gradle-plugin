@@ -17,7 +17,6 @@
 package wooga.gradle.snyk.gradle
 
 import com.wooga.snyk.GradleInit
-import org.apache.commons.io.FileUtils
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import wooga.gradle.snyk.SnykConventions
@@ -27,9 +26,6 @@ import wooga.gradle.snyk.cli.EnvironmentOption
 import wooga.gradle.snyk.cli.FailOnOption
 import wooga.gradle.snyk.cli.LifecycleOption
 import wooga.gradle.snyk.cli.SeverityThresholdOption
-
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 
 class GradlePluginSnykConventionPlugin implements Plugin<Project> {
 
